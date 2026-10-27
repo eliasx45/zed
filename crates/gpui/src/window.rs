@@ -1269,6 +1269,7 @@ pub struct Window {
     pub(crate) viewport_size: Size<Pixels>,
     /// Whole-window zoom on top of the display scale, like a browser's Cmd+= (1.0 = none).
     ui_zoom: f32,
+    ui_zoom_redraw_pending: bool,
     pub(crate) layout_engine: Option<TaffyLayoutEngine>,
     pub(crate) fast_layout: crate::fast::layout_key::WindowLayout,
     pub(crate) root: Option<AnyView>,
@@ -2196,6 +2197,7 @@ impl Window {
             rem_size_override_stack: SmallVec::new(),
             viewport_size: content_size,
             ui_zoom: 1.0,
+            ui_zoom_redraw_pending: false,
             layout_engine: Some(TaffyLayoutEngine::new()),
             fast_layout: crate::fast::layout_key::WindowLayout::default(),
             root: None,
@@ -2923,7 +2925,16 @@ impl Window {
         }
         self.ui_zoom = zoom;
         self.apply_platform_metrics();
-        self.refresh();
+        if self.invalidator.not_drawing() {
+            self.refresh();
+        } else {
+            // Called from a render (the usual place): this frame already took its root size
+            // from the old viewport, and `refresh` is ignored while drawing, so nothing would
+            // lay out again at the new size (zooming out left empty bands at the right and
+            // bottom). Draw once more, refreshing every view, right after this frame.
+            self.ui_zoom_redraw_pending = true;
+            self.invalidator.set_dirty(true);
+        }
     }
 
     /// Converts a platform event's window position into the zoomed coordinate space.
@@ -3701,6 +3712,9 @@ impl Window {
         let arena_scope = ElementArenaScope::enter(&cx.element_arena);
 
         if self.platform_window.prepare_frame() {
+            self.refresh();
+        }
+        if std::mem::take(&mut self.ui_zoom_redraw_pending) {
             self.refresh();
         }
         self.invalidate_entities();
