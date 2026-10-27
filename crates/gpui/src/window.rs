@@ -1267,6 +1267,8 @@ pub struct Window {
     /// a given rem size.
     pub(crate) rem_size_override_stack: SmallVec<[Pixels; 8]>,
     pub(crate) viewport_size: Size<Pixels>,
+    /// Whole-window zoom on top of the display scale, like a browser's Cmd+= (1.0 = none).
+    ui_zoom: f32,
     pub(crate) layout_engine: Option<TaffyLayoutEngine>,
     pub(crate) fast_layout: crate::fast::layout_key::WindowLayout,
     pub(crate) root: Option<AnyView>,
@@ -2193,6 +2195,7 @@ impl Window {
             rem_size: px(16.),
             rem_size_override_stack: SmallVec::new(),
             viewport_size: content_size,
+            ui_zoom: 1.0,
             layout_engine: Some(TaffyLayoutEngine::new()),
             fast_layout: crate::fast::layout_key::WindowLayout::default(),
             root: None,
@@ -2881,16 +2884,69 @@ impl Window {
     /// the platform window, then notifies observers. Normally called automatically
     /// by the platform's resize callback, but exposed publicly for test infrastructure.
     pub fn bounds_changed(&mut self, cx: &mut App) {
-        self.scale_factor = self.platform_window.scale_factor();
-        self.viewport_size = self.platform_window.content_size();
+        self.apply_platform_metrics();
         self.display_id = self.platform_window.display().map(|display| display.id());
-        self.mouse_position = self.platform_window.mouse_position();
 
         self.refresh();
 
         self.bounds_observers
             .clone()
             .retain(&(), |callback| callback(self, cx));
+    }
+
+    /// Reads the platform's scale, size and pointer and applies the window's zoom: everything
+    /// draws `ui_zoom` times larger and the layout gets the content size divided by it.
+    fn apply_platform_metrics(&mut self) {
+        let zoom = self.ui_zoom;
+        self.scale_factor = self.platform_window.scale_factor() * zoom;
+        let size = self.platform_window.content_size();
+        self.viewport_size = size.map(|length| length / zoom);
+        self.mouse_position = self.platform_window.mouse_position().map(|c| c / zoom);
+    }
+
+    /// The whole-window zoom (1.0 = none).
+    pub fn ui_zoom(&self) -> f32 {
+        self.ui_zoom
+    }
+
+    /// Zooms the whole window like a browser page: every element, text and image draws larger
+    /// (rasterised at the new scale, so it stays sharp) and layout reflows into the smaller
+    /// logical size. Pointer positions and IME bounds are converted, so hit testing still lines up.
+    pub fn set_ui_zoom(&mut self, zoom: f32) {
+        let zoom = if zoom.is_finite() {
+            zoom.clamp(0.5, 3.0)
+        } else {
+            1.0
+        };
+        if (zoom - self.ui_zoom).abs() < f32::EPSILON {
+            return;
+        }
+        self.ui_zoom = zoom;
+        self.apply_platform_metrics();
+        self.refresh();
+    }
+
+    /// Converts a platform event's window position into the zoomed coordinate space.
+    fn unzoom_input(&self, event: &mut PlatformInput) {
+        let zoom = self.ui_zoom;
+        if (zoom - 1.0).abs() < f32::EPSILON {
+            return;
+        }
+        let fix = |p: &mut Point<Pixels>| *p = p.map(|c| c / zoom);
+        match event {
+            PlatformInput::MouseDown(e) => fix(&mut e.position),
+            PlatformInput::MouseUp(e) => fix(&mut e.position),
+            PlatformInput::MouseMove(e) => fix(&mut e.position),
+            PlatformInput::MouseExited(e) => fix(&mut e.position),
+            PlatformInput::MousePressure(e) => fix(&mut e.position),
+            PlatformInput::ScrollWheel(e) => fix(&mut e.position),
+            PlatformInput::Pinch(e) => fix(&mut e.position),
+            PlatformInput::Touch(e) => fix(&mut e.position),
+            PlatformInput::FileDrop(FileDropEvent::Entered { position, .. })
+            | PlatformInput::FileDrop(FileDropEvent::Pending { position })
+            | PlatformInput::FileDrop(FileDropEvent::Submit { position }) => fix(position),
+            _ => {}
+        }
     }
 
     /// Returns the bounds of the current window in the global coordinate space, which could span across multiple displays.
@@ -4080,10 +4136,8 @@ impl Window {
                 } else {
                     // Shift left until the right edge meets the limit (the stock formula,
                     // `origin - right - limit`, always landed on the left limit).
-                    tooltip_bounds.origin.x = cmp::max(
-                        left_limit,
-                        right_limit - tooltip_bounds.size.width - px(1.),
-                    );
+                    tooltip_bounds.origin.x =
+                        cmp::max(left_limit, right_limit - tooltip_bounds.size.width - px(1.));
                 }
             }
 
@@ -5932,7 +5986,12 @@ impl Window {
 
     /// Dispatch a mouse, keyboard, or touch event on the window.
     #[profiling::function]
-    pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
+    pub fn dispatch_event(
+        &mut self,
+        mut event: PlatformInput,
+        cx: &mut App,
+    ) -> DispatchEventResult {
+        self.unzoom_input(&mut event);
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_input(event.kind_name());
         let update_count_before = self.invalidator.update_count();

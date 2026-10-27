@@ -2086,7 +2086,16 @@ impl PlatformInputHandler {
 
     pub fn bounds_for_range(&mut self, range_utf16: Range<usize>) -> Option<Bounds<Pixels>> {
         self.cx
-            .update(|window, cx| self.handler.bounds_for_range(range_utf16, window, cx))
+            .update(|window, cx| {
+                // The platform places the IME window in unzoomed window points.
+                let zoom = window.ui_zoom();
+                self.handler
+                    .bounds_for_range(range_utf16, window, cx)
+                    .map(|bounds| Bounds {
+                        origin: bounds.origin.map(|c| c * zoom),
+                        size: bounds.size.map(|c| c * zoom),
+                    })
+            })
             .ok()
             .flatten()
     }
@@ -2154,7 +2163,10 @@ impl PlatformInputHandler {
     #[allow(unused)]
     pub fn character_index_for_point(&mut self, point: Point<Pixels>) -> Option<usize> {
         self.cx
-            .update(|window, cx| self.handler.character_index_for_point(point, window, cx))
+            .update(|window, cx| {
+                let point = point.map(|c| c / window.ui_zoom());
+                self.handler.character_index_for_point(point, window, cx)
+            })
             .ok()
             .flatten()
     }
